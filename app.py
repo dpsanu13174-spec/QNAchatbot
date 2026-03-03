@@ -1,59 +1,97 @@
+from urllib.parse import urlparse
+
 import streamlit as st
-from langchain_groq import ChatGroq
+from groq import APIStatusError, AuthenticationError
+from langchain_community.document_loaders import WebBaseLoader, YoutubeLoader
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import PromptTemplate
+from langchain_groq import ChatGroq
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-import os
-from dotenv import load_dotenv
-load_dotenv()
+PROMPT = PromptTemplate.from_template(
+    """
+You are an expert summarization assistant.
+Summarize the following content clearly in 1-2 concise paragraphs.
+Ignore ads/navigation and focus only on meaningful information.
 
-
-os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_API_KEY"] = "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"
-os.environ["LANGSMITH_PROJECT"] = "QNACHATBOTWITHGROQ"
-
-##prompt template
-
-prompt=ChatPromptTemplate.from_messages(
-    [
-        ("system","Hey you are a helpful assistant please response to the user queries."),
-        ("user","question:{question}")
-    ]
-)
-
-def generate_response(question,api_key,llm,temperature,max_tokens):
-    os.environ["GROQ_API_KEY"] = api_key
-    llm=ChatGroq(model="openai/gpt-oss-120B")
-    output_parser=StrOutputParser()
-    chain=prompt|llm|output_parser
-    answer=chain.invoke({'question':question})
-    return answer
-
-
-###streamlit
-st.title("Settings")
-api_key = st.sidebar.text_input(
-    "Please Enter your Groq API key:",
-    type="password"
+Content:
+{text}
+"""
 )
 
 
-llm=st.sidebar.selectbox("Select a model",["openai/gpt-oss-120B","Mixtral-8x7B","openai/gpt-oss-20B"])
+def normalize_key(value: str) -> str:
+    return (value or "").strip().strip('"').strip("'")
 
 
-temperature=st.sidebar.slider("Temperature",min_value=0.0,max_value=1.0,value=0.7)
-max_tokens=st.sidebar.slider("Max Tokens",min_value=50,max_value=300,value=150)
-
-###question
-st.write("go ahead and ask any question")
-user_input=st.text_input("You:")
-
-if user_input:
-    response=generate_response(user_input,api_key,llm,temperature,max_tokens)
-    st.write(response)
-    
-else:
-    st.write("Please provide a query")    
+def is_youtube_url(value: str) -> bool:
+    host = urlparse(value).netloc.lower()
+    return "youtube.com" in host or "youtu.be" in host
 
 
+def load_documents(url: str):
+    if is_youtube_url(url):
+        try:
+            return YoutubeLoader.from_youtube_url(
+                url, add_video_info=False, language=["en", "hi"]
+            ).load()
+        except Exception as err:
+            st.warning(f"YouTube transcript failed ({err}). Falling back to page extraction.")
+    return WebBaseLoader(url).load()
+
+
+st.set_page_config(page_title="URL / YouTube Summarizer", page_icon="📝", layout="wide")
+st.title("Text Summarization with LangChain + Groq")
+
+st.sidebar.header("Configuration")
+api_key = normalize_key(st.sidebar.text_input("Groq API Key", type="password"))
+model = st.sidebar.selectbox(
+    "Groq Model", ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"], index=0
+)
+temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
+
+url = st.text_input(
+    "Enter YouTube or Website URL",
+    placeholder="https://www.youtube.com/watch?v=... or https://example.com/article",
+)
+
+if st.button("Summarize"):
+    if not api_key:
+        st.error("Please enter your Groq API key.")
+        st.stop()
+    if not api_key.startswith("gsk_"):
+        st.error("Invalid Groq API key format. It should start with 'gsk_'.")
+        st.stop()
+    if not url.startswith(("http://", "https://")):
+        st.error("Please enter a valid URL starting with http:// or https://")
+        st.stop()
+
+    try:
+        with st.spinner("Loading content..."):
+            docs = load_documents(url)
+        if not docs:
+            st.error("No content could be loaded from this URL.")
+            st.stop()
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=250)
+        text = "\n\n".join(d.page_content for d in splitter.split_documents(docs))
+
+        llm = ChatGroq(model=model, temperature=temperature, api_key=api_key)
+        chain = PROMPT | llm | StrOutputParser()
+
+        with st.spinner("Generating summary..."):
+            summary = chain.invoke({"text": text})
+
+        st.subheader("Summary")
+        st.write(summary)
+
+    except AuthenticationError:
+        st.error("Groq authentication failed (401). Please use a valid active API key.")
+    except APIStatusError as err:
+        if getattr(err, "status_code", None) == 401:
+            st.error("Groq authentication failed (401). Please regenerate your API key.")
+        else:
+            st.exception(err)
+    except Exception as err:
+        st.exception(err)
